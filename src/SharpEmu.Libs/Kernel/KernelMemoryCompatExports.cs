@@ -602,9 +602,7 @@ public static class KernelMemoryCompatExports
         }
         else
         {
-            ulong NextGpArg() => vaCursor.NextGpArg();
-            double NextFloatArg() => vaCursor.NextFloatArg();
-            rendered = FormatString(ctx, format, NextGpArg, NextFloatArg);
+            rendered = FormatString(ctx, format, ref vaCursor);
         }
 
         Console.Write(rendered);
@@ -2908,9 +2906,8 @@ public static class KernelMemoryCompatExports
 
         var format = Encoding.UTF8.GetString(formatBytes);
         var result = FormatString(ctx, format);
-        var outputBytes = Encoding.UTF8.GetBytes(result);
 
-        return WriteSnprintfOutput(ctx, destination, bufferSize, outputBytes);
+        return WriteSnprintfOutput(ctx, destination, bufferSize, result);
     }
 
     private static int VsnprintfCore(CpuContext ctx)
@@ -2931,12 +2928,9 @@ public static class KernelMemoryCompatExports
             return WriteSnprintfOutput(ctx, destination, bufferSize, formatBytes);
         }
 
-        ulong NextGpArg() => vaCursor.NextGpArg();
-        double NextFloatArg() => vaCursor.NextFloatArg();
-        var rendered = FormatString(ctx, format, NextGpArg, NextFloatArg);
+        var rendered = FormatString(ctx, format, ref vaCursor);
 
-        var outputBytes = Encoding.UTF8.GetBytes(rendered);
-        return WriteSnprintfOutput(ctx, destination, bufferSize, outputBytes);
+        return WriteSnprintfOutput(ctx, destination, bufferSize, rendered);
     }
 
     private static int SwprintfCore(CpuContext ctx)
@@ -2977,9 +2971,7 @@ public static class KernelMemoryCompatExports
         else
         {
             TraceWidePrintfVaList(ctx, "vswprintf", format, vaListAddress, vaCursor);
-            ulong NextGpArg() => vaCursor.NextGpArg();
-            double NextFloatArg() => vaCursor.NextFloatArg();
-            rendered = FormatString(ctx, format, NextGpArg, NextFloatArg);
+            rendered = FormatString(ctx, format, ref vaCursor);
         }
 
         TraceWidePrintf(ctx, "vswprintf", destination, bufferSize, format, rendered);
@@ -2994,10 +2986,8 @@ public static class KernelMemoryCompatExports
             return false;
         }
 
-        if (!TryReadUInt32Compat(ctx, vaListAddress + 0, out var gpOffset) ||
-            !TryReadUInt32Compat(ctx, vaListAddress + 4, out var fpOffset) ||
-            !TryReadUInt64Compat(ctx, vaListAddress + 8, out var overflowArgArea) ||
-            !TryReadUInt64Compat(ctx, vaListAddress + 16, out var regSaveArea))
+        Span<byte> vaList = stackalloc byte[24];
+        if (!TryReadCompat(ctx, vaListAddress, vaList))
         {
             return false;
         }
@@ -3005,10 +2995,10 @@ public static class KernelMemoryCompatExports
         cursor = new SysVAmd64VaListCursor(
             ctx,
             vaListAddress,
-            gpOffset,
-            fpOffset,
-            overflowArgArea,
-            regSaveArea);
+            BinaryPrimitives.ReadUInt32LittleEndian(vaList),
+            BinaryPrimitives.ReadUInt32LittleEndian(vaList[4..]),
+            BinaryPrimitives.ReadUInt64LittleEndian(vaList[8..]),
+            BinaryPrimitives.ReadUInt64LittleEndian(vaList[16..]));
         return true;
     }
 
@@ -3036,6 +3026,21 @@ public static class KernelMemoryCompatExports
 
         ctx[CpuRegister.Rax] = unchecked((ulong)outputBytes.Length);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static int WriteSnprintfOutput(
+        CpuContext ctx,
+        ulong destination,
+        ulong bufferSize,
+        string output)
+    {
+        if (bufferSize == 0 || destination == 0)
+        {
+            ctx[CpuRegister.Rax] = unchecked((ulong)Encoding.UTF8.GetByteCount(output));
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        return WriteSnprintfOutput(ctx, destination, bufferSize, Encoding.UTF8.GetBytes(output));
     }
 
     private static int WriteSwprintfOutput(
@@ -3329,30 +3334,8 @@ public static class KernelMemoryCompatExports
 
     internal static string FormatStringFromVarArgs(CpuContext ctx, string format, int firstGpArgIndex)
     {
-        var gpIndex = Math.Max(0, firstGpArgIndex);
-
-        ulong GetGpArg(int index)
-        {
-            return index switch
-            {
-                0 => ctx[CpuRegister.Rdi],
-                1 => ctx[CpuRegister.Rsi],
-                2 => ctx[CpuRegister.Rdx],
-                3 => ctx[CpuRegister.Rcx],
-                4 => ctx[CpuRegister.R8],
-                5 => ctx[CpuRegister.R9],
-                _ => ReadStackArg(ctx, (ulong)(index - 6) * 8)
-            };
-        }
-
-        ulong NextGpArg() => GetGpArg(gpIndex++);
-        double NextFloatArg()
-        {
-            var rawBits = NextGpArg();
-            return BitConverter.Int64BitsToDouble(unchecked((long)rawBits));
-        }
-
-        return FormatString(ctx, format, NextGpArg, NextFloatArg);
+        var argumentSource = new RegisterPrintfArgumentSource(ctx, Math.Max(0, firstGpArgIndex));
+        return FormatString(ctx, format, ref argumentSource);
     }
 
     private static string FormatString(CpuContext ctx, string format)
@@ -3360,13 +3343,13 @@ public static class KernelMemoryCompatExports
         return FormatStringFromVarArgs(ctx, format, firstGpArgIndex: 3);
     }
 
-    private static string FormatString(
+    private static string FormatString<TArgumentSource>(
         CpuContext ctx,
         string format,
-        Func<ulong> nextGpArg,
-        Func<double> nextFloatArg)
+        ref TArgumentSource argumentSource)
+        where TArgumentSource : struct, IPrintfArgumentSource
     {
-        var sb = new StringBuilder();
+        var sb = new StringBuilder(format.Length + 32);
 
         for (var i = 0; i < format.Length; i++)
         {
@@ -3405,7 +3388,7 @@ public static class KernelMemoryCompatExports
             var width = 0;
             if (i < format.Length && format[i] == '*')
             {
-                width = unchecked((int)nextGpArg());
+                width = unchecked((int)argumentSource.NextGpArg());
                 i++;
                 if (width < 0)
                 {
@@ -3428,7 +3411,7 @@ public static class KernelMemoryCompatExports
                 i++;
                 if (i < format.Length && format[i] == '*')
                 {
-                    precision = unchecked((int)nextGpArg());
+                    precision = unchecked((int)argumentSource.NextGpArg());
                     i++;
                 }
                 else if (i < format.Length && char.IsDigit(format[i]))
@@ -3482,14 +3465,14 @@ public static class KernelMemoryCompatExports
                     {
                         long value = lengthMod switch
                         {
-                            "hh" => unchecked((sbyte)nextGpArg()),
-                            "h" => unchecked((short)nextGpArg()),
-                            "l" => unchecked((long)nextGpArg()),
-                            "ll" => unchecked((long)nextGpArg()),
-                            "j" => unchecked((long)nextGpArg()),
-                            "z" => unchecked((long)nextGpArg()),
-                            "t" => unchecked((long)nextGpArg()),
-                            _ => unchecked((int)nextGpArg())
+                            "hh" => unchecked((sbyte)argumentSource.NextGpArg()),
+                            "h" => unchecked((short)argumentSource.NextGpArg()),
+                            "l" => unchecked((long)argumentSource.NextGpArg()),
+                            "ll" => unchecked((long)argumentSource.NextGpArg()),
+                            "j" => unchecked((long)argumentSource.NextGpArg()),
+                            "z" => unchecked((long)argumentSource.NextGpArg()),
+                            "t" => unchecked((long)argumentSource.NextGpArg()),
+                            _ => unchecked((int)argumentSource.NextGpArg())
                         };
 
                         var formatted = value.ToString();
@@ -3506,14 +3489,14 @@ public static class KernelMemoryCompatExports
                     {
                         ulong value = lengthMod switch
                         {
-                            "hh" => (byte)nextGpArg(),
-                            "h" => (ushort)nextGpArg(),
-                            "l" => nextGpArg(),
-                            "ll" => nextGpArg(),
-                            "j" => nextGpArg(),
-                            "z" => nextGpArg(),
-                            "t" => nextGpArg(),
-                            _ => (uint)nextGpArg()
+                            "hh" => (byte)argumentSource.NextGpArg(),
+                            "h" => (ushort)argumentSource.NextGpArg(),
+                            "l" => argumentSource.NextGpArg(),
+                            "ll" => argumentSource.NextGpArg(),
+                            "j" => argumentSource.NextGpArg(),
+                            "z" => argumentSource.NextGpArg(),
+                            "t" => argumentSource.NextGpArg(),
+                            _ => (uint)argumentSource.NextGpArg()
                         };
 
                         var formatted = value.ToString();
@@ -3526,14 +3509,14 @@ public static class KernelMemoryCompatExports
                     {
                         ulong value = lengthMod switch
                         {
-                            "hh" => (byte)nextGpArg(),
-                            "h" => (ushort)nextGpArg(),
-                            "l" => nextGpArg(),
-                            "ll" => nextGpArg(),
-                            "j" => nextGpArg(),
-                            "z" => nextGpArg(),
-                            "t" => nextGpArg(),
-                            _ => (uint)nextGpArg()
+                            "hh" => (byte)argumentSource.NextGpArg(),
+                            "h" => (ushort)argumentSource.NextGpArg(),
+                            "l" => argumentSource.NextGpArg(),
+                            "ll" => argumentSource.NextGpArg(),
+                            "j" => argumentSource.NextGpArg(),
+                            "z" => argumentSource.NextGpArg(),
+                            "t" => argumentSource.NextGpArg(),
+                            _ => (uint)argumentSource.NextGpArg()
                         };
 
                         var formatted = specifier == 'x'
@@ -3551,14 +3534,14 @@ public static class KernelMemoryCompatExports
                     {
                         ulong value = lengthMod switch
                         {
-                            "hh" => (byte)nextGpArg(),
-                            "h" => (ushort)nextGpArg(),
-                            "l" => nextGpArg(),
-                            "ll" => nextGpArg(),
-                            "j" => nextGpArg(),
-                            "z" => nextGpArg(),
-                            "t" => nextGpArg(),
-                            _ => (uint)nextGpArg()
+                            "hh" => (byte)argumentSource.NextGpArg(),
+                            "h" => (ushort)argumentSource.NextGpArg(),
+                            "l" => argumentSource.NextGpArg(),
+                            "ll" => argumentSource.NextGpArg(),
+                            "j" => argumentSource.NextGpArg(),
+                            "z" => argumentSource.NextGpArg(),
+                            "t" => argumentSource.NextGpArg(),
+                            _ => (uint)argumentSource.NextGpArg()
                         };
 
                         var formatted = Convert.ToString((long)value, 8);
@@ -3571,7 +3554,7 @@ public static class KernelMemoryCompatExports
 
                 case 'p':
                     {
-                        var value = nextGpArg();
+                        var value = argumentSource.NextGpArg();
                         var formatted = value == 0
                             ? "(nil)"
                             : $"0x{value:X}";
@@ -3581,7 +3564,7 @@ public static class KernelMemoryCompatExports
 
                 case 's':
                     {
-                        var strAddr = nextGpArg();
+                        var strAddr = argumentSource.NextGpArg();
                         TracePrintfStringArgument(ctx, lengthMod, strAddr);
                         if (strAddr == 0)
                         {
@@ -3620,14 +3603,14 @@ public static class KernelMemoryCompatExports
                         string renderedChar;
                         if (lengthMod == "l")
                         {
-                            var scalar = unchecked((ushort)nextGpArg());
+                            var scalar = unchecked((ushort)argumentSource.NextGpArg());
                             renderedChar = TryConvertWideScalarToString(scalar, out var wideCharText)
                                 ? wideCharText
                                 : "?";
                         }
                         else
                         {
-                            renderedChar = ((char)(byte)nextGpArg()).ToString();
+                            renderedChar = ((char)(byte)argumentSource.NextGpArg()).ToString();
                         }
 
                         sb.Append(PadString(renderedChar, width, leftAlign, false));
@@ -3641,7 +3624,7 @@ public static class KernelMemoryCompatExports
                 case 'g':
                 case 'G':
                     {
-                        var value = nextFloatArg();
+                        var value = argumentSource.NextFloatArg();
 
                         var formatStr = precision >= 0
                             ? $"{{0:{specifier}{precision}}}"
@@ -3659,7 +3642,7 @@ public static class KernelMemoryCompatExports
 
                 case 'n':
                     {
-                        var addr = nextGpArg();
+                        var addr = argumentSource.NextGpArg();
                         if (addr != 0)
                         {
                             _ = TryWriteInt32(ctx, addr, sb.Length);
@@ -3699,7 +3682,46 @@ public static class KernelMemoryCompatExports
         return leftAlign ? str + padding : padding + str;
     }
 
-    private struct SysVAmd64VaListCursor
+    private interface IPrintfArgumentSource
+    {
+        ulong NextGpArg();
+
+        double NextFloatArg();
+    }
+
+    private struct RegisterPrintfArgumentSource : IPrintfArgumentSource
+    {
+        private readonly CpuContext _ctx;
+        private int _gpIndex;
+
+        public RegisterPrintfArgumentSource(CpuContext ctx, int gpIndex)
+        {
+            _ctx = ctx;
+            _gpIndex = gpIndex;
+        }
+
+        public ulong NextGpArg()
+        {
+            var index = _gpIndex++;
+            return index switch
+            {
+                0 => _ctx[CpuRegister.Rdi],
+                1 => _ctx[CpuRegister.Rsi],
+                2 => _ctx[CpuRegister.Rdx],
+                3 => _ctx[CpuRegister.Rcx],
+                4 => _ctx[CpuRegister.R8],
+                5 => _ctx[CpuRegister.R9],
+                _ => ReadStackArg(_ctx, (ulong)(index - 6) * 8)
+            };
+        }
+
+        public double NextFloatArg()
+        {
+            return BitConverter.Int64BitsToDouble(unchecked((long)NextGpArg()));
+        }
+    }
+
+    private struct SysVAmd64VaListCursor : IPrintfArgumentSource
     {
         private const uint GpSaveAreaLimit = 48;
         private const uint FpSaveAreaLimit = 176;
@@ -4297,9 +4319,32 @@ public static class KernelMemoryCompatExports
         }
 
         const int maxChunkSize = 4096;
+        const int inlineChunkSize = 256;
+        Span<byte> inlineChunk = stackalloc byte[inlineChunkSize];
+        var firstPageRemaining = maxChunkSize - (int)(address & (maxChunkSize - 1));
+        var firstReadLength = Math.Min(limit, Math.Min(inlineChunkSize, firstPageRemaining));
+        var firstSpan = inlineChunk[..firstReadLength];
+        ulong offset = 0;
+        if (TryReadCompat(ctx, address, firstSpan))
+        {
+            var nulIndex = firstSpan.IndexOf((byte)0);
+            if (nulIndex >= 0)
+            {
+                bytes = firstSpan[..nulIndex].ToArray();
+                return true;
+            }
+
+            offset = unchecked((ulong)firstReadLength);
+        }
+
         var chunk = GC.AllocateUninitializedArray<byte>(Math.Min(maxChunkSize, limit));
         var writer = new ArrayBufferWriter<byte>(Math.Min(limit, 256));
-        ulong offset = 0;
+        if (offset != 0)
+        {
+            firstSpan.CopyTo(writer.GetSpan(firstReadLength));
+            writer.Advance(firstReadLength);
+        }
+
         while (offset < (ulong)limit)
         {
             var current = address + offset;
