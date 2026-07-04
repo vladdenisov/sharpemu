@@ -8,6 +8,7 @@ using SharpEmu.Libs.Agc;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 using Silk.NET.Windowing;
+using SharpEmu.Libs.Pad;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
@@ -1048,6 +1049,7 @@ internal static unsafe class VulkanVideoPresenter
         private void Initialize()
         {
             WaitForRenderDocAttachIfRequested();
+            GamepadInput.Initialize(_window);
             _vk = Vk.GetApi();
             CreateInstance();
             CreateSurface();
@@ -5951,6 +5953,7 @@ internal static unsafe class VulkanVideoPresenter
 
         private void DisposeVulkan()
         {
+            GamepadInput.Shutdown();
             if (!_vulkanReady)
             {
                 return;

@@ -164,19 +164,29 @@ public static class PadExports
     {
         Span<byte> data = stackalloc byte[PadDataSize];
         data.Clear();
+        var gamepad = GamepadInput.Capture();
         var acceptsKeyboardInput = IsEmulatorWindowFocused();
-        var buttons = acceptsKeyboardInput ? ReadKeyboardButtons() : 0;
+        var keyboardButtons = acceptsKeyboardInput ? ReadKeyboardButtons() : 0;
+        var buttons = gamepad.Buttons | keyboardButtons;
         BinaryPrimitives.WriteUInt32LittleEndian(data[0x00..], buttons);
-        var leftX = acceptsKeyboardInput ? ReadAnalogStick(IsKeyDown(0x41), IsKeyDown(0x44)) : (byte)128;
-        var leftY = acceptsKeyboardInput ? ReadAnalogStick(IsKeyDown(0x57), IsKeyDown(0x53)) : (byte)128;
-        var rightX = acceptsKeyboardInput ? ReadAnalogStick(IsKeyDown(0x4A), IsKeyDown(0x4C)) : (byte)128;
-        var rightY = acceptsKeyboardInput ? ReadAnalogStick(IsKeyDown(0x49), IsKeyDown(0x4B)) : (byte)128;
+        var leftX = acceptsKeyboardInput
+            ? MergeStickAxis(gamepad.LeftX, IsKeyDown(0x41), IsKeyDown(0x44))
+            : gamepad.LeftX;
+        var leftY = acceptsKeyboardInput
+            ? MergeStickAxis(gamepad.LeftY, IsKeyDown(0x57), IsKeyDown(0x53))
+            : gamepad.LeftY;
+        var rightX = acceptsKeyboardInput
+            ? MergeStickAxis(gamepad.RightX, IsKeyDown(0x4A), IsKeyDown(0x4C))
+            : gamepad.RightX;
+        var rightY = acceptsKeyboardInput
+            ? MergeStickAxis(gamepad.RightY, IsKeyDown(0x49), IsKeyDown(0x4B))
+            : gamepad.RightY;
         data[0x04] = leftX;
         data[0x05] = leftY;
         data[0x06] = rightX;
         data[0x07] = rightY;
-        data[0x08] = acceptsKeyboardInput && IsKeyDown(0x52) ? (byte)255 : (byte)0;
-        data[0x09] = acceptsKeyboardInput && IsKeyDown(0x46) ? (byte)255 : (byte)0;
+        data[0x08] = acceptsKeyboardInput && IsKeyDown(0x52) ? (byte)255 : gamepad.LeftTrigger;
+        data[0x09] = acceptsKeyboardInput && IsKeyDown(0x46) ? (byte)255 : gamepad.RightTrigger;
         BinaryPrimitives.WriteSingleLittleEndian(data[0x18..], 1.0f);
         data[0x4C] = 1;
         var timestampTicks = Stopwatch.GetTimestamp();
@@ -249,5 +259,11 @@ public static class PadExports
         if (negative && !positive) return 0;
         if (positive && !negative) return 255;
         return 128;
+    }
+
+    private static byte MergeStickAxis(byte gamepadValue, bool negative, bool positive)
+    {
+        var keyboardValue = ReadAnalogStick(negative, positive);
+        return keyboardValue == 128 ? gamepadValue : keyboardValue;
     }
 }
